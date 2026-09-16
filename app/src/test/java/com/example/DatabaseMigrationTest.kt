@@ -271,4 +271,155 @@ class DatabaseMigrationTest {
             Locale.setDefault(originalLocale)
         }
     }
+
+    @Test
+    fun `verify migration from v1 to v2 handles difficult decimal values deterministically`() = runBlocking {
+        // Step 1: Create a Version 1 SQLite database with REAL numeric columns
+        val v1Helper = object : SQLiteOpenHelper(context, dbName, null, 1) {
+            override fun onCreate(db: SQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE `user_settings` (
+                        `id` INTEGER NOT NULL,
+                        `monthlyIncome` REAL NOT NULL,
+                        `savingsTarget` REAL NOT NULL,
+                        `currency` TEXT NOT NULL,
+                        `languageCode` TEXT NOT NULL,
+                        `isOnboardingCompleted` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE `fixed_expenses` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `amount` REAL NOT NULL,
+                        `category` TEXT NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE `transactions` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `amount` REAL NOT NULL,
+                        `category` TEXT NOT NULL,
+                        `timestamp` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+
+            override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+        }
+
+        // Step 2: Seed difficult decimal values into SQLite REAL columns
+        // Test values:
+        // - 12.345 TND
+        // - 0.001 TND
+        // - 0.100 TND
+        // - 1234.567 TND
+        // - 999999.999 TND
+        val v1Db = v1Helper.writableDatabase
+
+        // In user_settings: monthlyIncome = 999999.999, savingsTarget = 1234.567
+        v1Db.execSQL(
+            "INSERT INTO `user_settings` (`id`, `monthlyIncome`, `savingsTarget`, `currency`, `languageCode`, `isOnboardingCompleted`) VALUES (1, 999999.999, 1234.567, 'DT', 'fr', 1)"
+        )
+
+        // In fixed_expenses: amount = 12.345
+        v1Db.execSQL(
+            "INSERT INTO `fixed_expenses` (`id`, `title`, `amount`, `category`) VALUES (10, 'Difficult Fixed Decimal', 12.345, 'HOUSING')"
+        )
+
+        // In transactions:
+        // Tx 201: 0.001 TND
+        // Tx 202: 0.100 TND (0.1 in float)
+        // Tx 203: 12.345 TND
+        // Tx 204: 1234.567 TND
+        // Tx 205: 999999.999 TND
+        val baseTime = 1715000000000L
+        v1Db.execSQL("INSERT INTO `transactions` (`id`, `title`, `amount`, `category`, `timestamp`) VALUES (201, 'One Millime', 0.001, 'OTHER', ${baseTime + 1000})")
+        v1Db.execSQL("INSERT INTO `transactions` (`id`, `title`, `amount`, `category`, `timestamp`) VALUES (202, 'Hundred Millimes', 0.1, 'FOOD', ${baseTime + 2000})")
+        v1Db.execSQL("INSERT INTO `transactions` (`id`, `title`, `amount`, `category`, `timestamp`) VALUES (203, 'Twelve Dinars 345 Millimes', 12.345, 'TRANSPORT', ${baseTime + 3000})")
+        v1Db.execSQL("INSERT INTO `transactions` (`id`, `title`, `amount`, `category`, `timestamp`) VALUES (204, 'Large Fractional Expense', 1234.567, 'BILLS', ${baseTime + 4000})")
+        v1Db.execSQL("INSERT INTO `transactions` (`id`, `title`, `amount`, `category`, `timestamp`) VALUES (205, 'Max Millimes Expense', 999999.999, 'LEISURE', ${baseTime + 5000})")
+
+        v1Helper.close()
+
+        // Step 3: Run MIGRATION_1_2
+        val upgradedDb = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_1_2)
+            .build()
+
+        // Step 4: Verify UserSettings
+        val settings = upgradedDb.userSettingsDao().getSettingsOnce()
+        assertNotNull("UserSettings must exist after migration", settings)
+        assertEquals(1, settings!!.id)
+        assertEquals("999999.999 TND preserved", BigDecimal("999999.999"), settings.monthlyIncome)
+        assertEquals("1234.567 TND preserved", BigDecimal("1234.567"), settings.savingsTarget)
+        assertEquals("DT", settings.currency)
+        assertEquals("fr", settings.languageCode)
+        assertTrue(settings.isOnboardingCompleted)
+
+        // Step 5: Verify Fixed Expenses
+        val fixedExpenses = upgradedDb.fixedExpenseDao().getAllFixedExpenses().first()
+        assertEquals("Fixed expense count must match exactly", 1, fixedExpenses.size)
+        val fixed = fixedExpenses[0]
+        assertEquals(10L, fixed.id)
+        assertEquals("Difficult Fixed Decimal", fixed.title)
+        assertEquals(BigDecimal("12.345"), fixed.amount)
+        assertEquals("HOUSING", fixed.category)
+
+        // Step 6: Verify Transactions (Count, IDs, Timestamps, Amounts, No reset, No duplicates)
+        val transactions = upgradedDb.transactionDao().getAllTransactions().first()
+        assertEquals("Transaction count must be exactly 5", 5, transactions.size)
+
+        val txMap = transactions.associateBy { it.id }
+
+        // 201: 0.001 TND
+        val tx201 = txMap[201L]
+        assertNotNull("Tx 201 must exist", tx201)
+        assertEquals("One Millime", tx201!!.title)
+        assertEquals("0.001 TND exact 3-decimal millime precision", BigDecimal("0.001"), tx201.amount)
+        assertEquals("OTHER", tx201.category)
+        assertEquals(baseTime + 1000, tx201.timestamp)
+
+        // 202: 0.100 TND
+        val tx202 = txMap[202L]
+        assertNotNull("Tx 202 must exist", tx202)
+        assertEquals("Hundred Millimes", tx202!!.title)
+        assertEquals("0.100 TND exact 3-decimal millime precision", BigDecimal("0.100"), tx202.amount)
+        assertEquals("FOOD", tx202.category)
+        assertEquals(baseTime + 2000, tx202.timestamp)
+
+        // 203: 12.345 TND
+        val tx203 = txMap[203L]
+        assertNotNull("Tx 203 must exist", tx203)
+        assertEquals("Twelve Dinars 345 Millimes", tx203!!.title)
+        assertEquals("12.345 TND exact 3-decimal millime precision", BigDecimal("12.345"), tx203.amount)
+        assertEquals("TRANSPORT", tx203.category)
+        assertEquals(baseTime + 3000, tx203.timestamp)
+
+        // 204: 1234.567 TND
+        val tx204 = txMap[204L]
+        assertNotNull("Tx 204 must exist", tx204)
+        assertEquals("Large Fractional Expense", tx204!!.title)
+        assertEquals("1234.567 TND exact 3-decimal millime precision", BigDecimal("1234.567"), tx204.amount)
+        assertEquals("BILLS", tx204.category)
+        assertEquals(baseTime + 4000, tx204.timestamp)
+
+        // 205: 999999.999 TND
+        val tx205 = txMap[205L]
+        assertNotNull("Tx 205 must exist", tx205)
+        assertEquals("Max Millimes Expense", tx205!!.title)
+        assertEquals("999999.999 TND exact 3-decimal millime precision", BigDecimal("999999.999"), tx205.amount)
+        assertEquals("LEISURE", tx205.category)
+        assertEquals(baseTime + 5000, tx205.timestamp)
+
+        upgradedDb.close()
+    }
 }

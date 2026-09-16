@@ -1,6 +1,7 @@
 package com.example.data
 
 import android.content.Context
+import android.database.Cursor
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
@@ -57,10 +58,18 @@ abstract class AppDatabase : RoomDatabase() {
          */
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                fun toExactMoneyString(raw: String?, default: String): String {
-                    if (raw.isNullOrBlank()) return default
+                fun readMoneyValueFromCursor(cursor: Cursor, columnIndex: Int, default: String): String {
+                    if (cursor.isNull(columnIndex)) return default
                     return try {
-                        BigDecimal(raw.trim()).setScale(3, RoundingMode.HALF_EVEN).toPlainString()
+                        val type = cursor.getType(columnIndex)
+                        val rawStr = if (type == Cursor.FIELD_TYPE_FLOAT) {
+                            val doubleVal = cursor.getDouble(columnIndex)
+                            doubleVal.toString()
+                        } else {
+                            cursor.getString(columnIndex)
+                        }
+                        if (rawStr.isNullOrBlank()) return default
+                        BigDecimal(rawStr.trim()).setScale(3, RoundingMode.HALF_EVEN).toPlainString()
                     } catch (e: Exception) {
                         default
                     }
@@ -94,14 +103,12 @@ abstract class AppDatabase : RoomDatabase() {
                     cursor.use { c ->
                         while (c.moveToNext()) {
                             val id = c.getLong(0)
-                            val incomeRaw = c.getString(1)
-                            val savingsRaw = c.getString(2)
                             val currency = c.getString(3) ?: "DT"
                             val languageCode = c.getString(4) ?: "en"
                             val completed = c.getLong(5)
 
-                            val income = toExactMoneyString(incomeRaw, "2000.000")
-                            val savings = toExactMoneyString(savingsRaw, "300.000")
+                            val income = readMoneyValueFromCursor(c, 1, "2000.000")
+                            val savings = readMoneyValueFromCursor(c, 2, "300.000")
 
                             val stmt = db.compileStatement(
                                 "INSERT INTO `user_settings_v2_temp` (`id`, `monthlyIncome`, `savingsTarget`, `currency`, `languageCode`, `isOnboardingCompleted`) VALUES (?, ?, ?, ?, ?, ?)"
@@ -141,10 +148,8 @@ abstract class AppDatabase : RoomDatabase() {
                         while (c.moveToNext()) {
                             val id = c.getLong(0)
                             val title = c.getString(1) ?: ""
-                            val amountRaw = c.getString(2)
                             val category = c.getString(3) ?: "HOUSING"
-
-                            val amount = toExactMoneyString(amountRaw, "0.000")
+                            val amount = readMoneyValueFromCursor(c, 2, "0.000")
 
                             val stmt = db.compileStatement(
                                 "INSERT INTO `fixed_expenses_v2_temp` (`id`, `title`, `amount`, `category`) VALUES (?, ?, ?, ?)"
@@ -183,11 +188,9 @@ abstract class AppDatabase : RoomDatabase() {
                         while (c.moveToNext()) {
                             val id = c.getLong(0)
                             val title = c.getString(1) ?: ""
-                            val amountRaw = c.getString(2)
                             val category = c.getString(3) ?: "OTHER"
                             val timestamp = c.getLong(4)
-
-                            val amount = toExactMoneyString(amountRaw, "0.000")
+                            val amount = readMoneyValueFromCursor(c, 2, "0.000")
 
                             val stmt = db.compileStatement(
                                 "INSERT INTO `transactions_v2_temp` (`id`, `title`, `amount`, `category`, `timestamp`) VALUES (?, ?, ?, ?, ?)"
