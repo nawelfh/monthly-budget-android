@@ -1,0 +1,6 @@
+{
+  "name": "Personal Finance",
+  "description": "Personal finance app to track monthly income, fixed expenses, planned savings, and safe daily spending.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
